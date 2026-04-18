@@ -206,6 +206,9 @@ pub mod tests {
     #[test]
     fn readme_example() -> Result<(), Box<dyn Error>> {
         let path = "E:/Metaphor/base_cpk/COMMON/sound/bgm.acb";
+        if !std::fs::exists(path)? {
+            return Ok(());
+        }
         let mut handle = BufReader::new(File::open(path)?);
         let mut header_serial: MaybeUninit<[u8; HEADER_SIZE]> = MaybeUninit::uninit();
         // Read the table header at 0x0 (ACB, ACF, AWB)
