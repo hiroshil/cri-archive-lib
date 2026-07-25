@@ -1,159 +1,90 @@
 # cri-archive-lib
 
-A Rust crate for reading CRI table formats. The CPK portion of this crate is effectively a port of 
-[CriFsV2Lib](https://github.com/Sewer56/CriFsV2Lib) from C#.
+Rust support for CRI `@UTF` tables and CPK archives. The CPK reader handles named TOC archives, standard `DataL`/`DataH` ITOC archives, direct/EID ITOC archives, encrypted table chunks, Shift-JIS string pools, and CriLAYLA extraction when `cpk_compression_layla` is enabled.
 
-## CPK Extractor Tool
+The workspace contains `cri-cpk-cli`, a combined unpack/pack command-line tool.
 
-`cri-cpk-extractor-lib` is a tool for extracting all files from an input CPK. Downloads are available in Releases.
+## CLI
 
-This program can either be run by dragging a CPK file onto the executable or through the command line using the following:
+### Unpack
 
+```text
+cri-cpk-cli unpack <input.cpk> [output-dir]
 ```
-./cri-cpk-extractor-cli.exe [Input] (Output)
+
+For Persona 5 Royal's file-level transform:
+
+```text
+cri-cpk-cli unpack <input.cpk> [output-dir] --p5r
 ```
 
-![CPK Extraction on P5R's EN.CPK](assets/cpk-extract-cli.gif)
+The old drag-and-drop/bare-path form remains accepted:
 
-Where for each of the following parameters:
-- **Input**: A path to the imput CPK which will get extracted
-- **Output (optional)**: The folder that the CPK's files will get written into. By default, this will create a folder
-adjacent to the CPK with it's name.
+```text
+cri-cpk-cli <input.cpk> [output-dir]
+```
 
-## Crate Features
+### Pack
 
-- **CRI Table Parsing Structures**
-- **CPK Parsing**
-- **CriLAYLA Decompression**
-- **Table Decryption**
-- **User-definable File Decryption**
+```text
+cri-cpk-cli pack <input-dir> [output.cpk] [--align 0x800] [--p5r] [--reuse-raw-entries]
+```
 
-## Crate Usage
+`unpack` writes `.cri-cpk-manifest-v2`. The manifest records the source archive profile and per-entry metadata required to rebuild the same index model: TOC, standard ITOC, direct/EID ITOC, or TOC+ITOC; row order; IDs; `UserString`; packed and extracted sizes; original packed offsets; alignment; and P5R mode.
 
-### Table Parsing Structures
+`pack` always serializes a new CPK header and new TOC/ITOC tables. By default it also rebuilds every entry payload from the extracted file, including an unchanged unpack/pack cycle. It never copies the complete original CPK as a round-trip shortcut.
 
-- **`TableHeader`**: A thin wrapper around a byte slice starting at where the table begins in the stream.
-- **`Column`**: Represents a column in the CRI Table. Contains data type information, a pointer to the column's name that can be retrived using a `StringPool` and a default value if applicable
-- **`StringPoolImpl` and `StringPoolFast`**: Holds references to strings from the stream. Used to retrieve strings from string pointers (`u32` relative to `string_pool_offset`). Implementors of `StringPool`.
-- **`Row`**: A row of values (`RowValue`) for each column. 
+`--reuse-raw-entries` is an explicit optimization. For each unchanged entry only, it copies that entry's original packed byte range from the source CPK. The containing CPK header, TOC, ITOC, offsets, sizes, padding, and content plan are still rebuilt. Changed and newly added entries are always rebuilt from extracted files.
 
-**Example**:
+Without a manifest, `pack` creates a new TOC archive and assigns deterministic IDs.
+
+## Writer layout used by the target engine
+
+- canonical plaintext chunk marker `ff ff ff ff` and the engine-specific `@UTF` header: marker at `+0x08`, encoding at `+0x09`, big-endian `u16 RowsOffset` at `+0x0a`;
+- CPK header at `0x0000`, entirely before `0x0800`;
+- TOC at `0x0800` when present;
+- TOC `FileOffset` stored relative to `0x0800`;
+- ITOC payload offsets computed from `ContentOffset` by aligned cumulative packed sizes; ITOC output is rejected when `ContentOffset > 0xffffffff` because this engine stores the base in a 32-bit state field;
+- standard ITOC physical order: `DataL` rows, then `DataH` rows;
+- each ITOC table sorted by ascending 16-bit ID because the engine binary-searches it;
+- both `DataL` and `DataH` are emitted in standard ITOC, using a valid zero-row nested table when a group is empty;
+- content, every payload start, and final archive size aligned to `Align`;
+- TOC columns emitted in the fixed order used by the engine;
+- `Sorted = 0`, forcing linear pathname lookup and avoiding an incompatible proprietary TOC sort order;
+- rebuilt payloads stored uncompressed with `ExtractSize == FileSize`;
+- optional P5R re-encryption for rebuilt entries marked `CRI_CFATTR:ENCRYPT`.
+
+The writer does not currently generate CriLAYLA compression, ETOC, GTOC, or CRC tables. It disables the corresponding header flags instead of leaving stale metadata.
+
+## Basic library usage
 
 ```rust
-use std::fs::File;
-use std::io::{BufReader, Read};
-use std::mem::MaybeUninit;
-use crate::schema::columns::Column;
-use crate::schema::header::{TableHeader, HEADER_SIZE};
-use crate::schema::strings::{ StringPool, StringPoolImpl };
-use crate::schema::rows::{Row, RowValue};
-
-// ...
-
-// Read sample ACB (using Metaphor: ReFantazio's BGM ACB)
-let mut handle = BufReader::new(File::open("E:/Metaphor/base_cpk/COMMON/sound/bgm.acb")?);
-let mut header_serial: MaybeUninit<[u8; HEADER_SIZE]> = MaybeUninit::uninit();
-// Read the table header at 0x0 (ACB, ACF, AWB)
-handle.read_exact(unsafe { header_serial.assume_init_mut() })?;
-let header_serial = unsafe { header_serial.assume_init() };
-let header = TableHeader::new(&header_serial);
-// Read columns/rows
-let columns = Column::new_list(&mut handle, &header)?;
-let string_pool = StringPoolImpl::new(&mut handle, &header)?;
-let rows = Row::new_list(&mut handle, &header, &columns)?;
-let acb_row = &rows[0]; // ACB header has only one row
-// find the column for "AcfMd5Hash"
-let mut acf_md5_hash: Option<usize> = None;
-for (i, c) in columns.iter().enumerate() {
-  if let Some(str) = string_pool.get_string(c.get_string_offset()) {
-    if str == "AcfMd5Hash" {
-      acf_md5_hash = Some(i);
-      break;
-    }
-  }
-}
-if let Some(acf_col) = acf_md5_hash {
-  if let RowValue::Data(hash) = &acb_row[acf_col] {
-    // read the ACF MD5 hash
-    handle.seek(SeekFrom::Start((header.data_pool_offset() + hash.offset) as u64))?;
-    let mut acf_md5 = Vec::with_capacity(hash.length as usize);
-    unsafe { acf_md5.set_len(acf_md5.capacity()) };
-    handle.read_exact(&mut acf_md5)?;
-    println!("{:?}", acf_md5);
-  }
-}
-Ok(())
-```
-
-Output:
-```
-[236, 103, 97, 106, 90, 25, 172, 164, 161, 234, 209, 75, 242, 34, 227, 209]
-```
-
-### `CpkReader` Usage
-
-```rust
-use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
-use crate::cpk::encrypt::p5r::P5RDecryptor;
-use crate::cpk::reader::CpkReader;
+use cri_archive_lib::cpk::reader::CpkReader;
 
-// ...
-
-// P5R: Extract C0001_002_00.GMD from BASE.CPK
-// Adapted from one of the unit tests
-
-// Define a CpkReader with a custom decryptor
-let mut reader = CpkReader::<_, P5RDecryptor>::new_with_encryption(
-    BufReader::new(File::open("E:/SteamLibrary/steamapps/common/P5R/CPK/BASE.CPK")?))?;
-// Get a file list
-let files = reader.get_files()?;
-let mut file_lookup = HashMap::new();
-for file in &files {
-    file_lookup.insert(format!("{}/{}", file.directory(), file.file_name()), file);
+fn extract_first(path: &str) -> Result<(), Box<dyn Error>> {
+    let mut reader = CpkReader::new(BufReader::new(File::open(path)?))?;
+    let files = reader.get_files()?;
+    let data = reader.extract_file(&files[0])?;
+    std::fs::write(files[0].file_name(), data)?;
+    Ok(())
 }
-let joker_persona_5 = file_lookup.get("MODEL/CHARACTER/0001/C0001_002_00.GMD").unwrap();
-// Extract the file, performing decryption and decompression and write it out
-let joker_persona_5 = reader.extract_file(joker_persona_5)?;
-std::fs::write("joker_persona_5.GMD", joker_persona_5)?;
-Ok(())
 ```
 
-## Performance
+```rust
+use std::error::Error;
+use cri_archive_lib::cpk::writer::{CpkWriter, CpkWriterOptions};
 
-Performance was heavily optimized for parts of the crate that are used by `CpkReader`'s `extract_file`.
+fn pack(input: &str, output: &str) -> Result<(), Box<dyn Error>> {
+    CpkWriter::pack_directory(input, output, CpkWriterOptions::default())?;
+    Ok(())
+}
+```
 
-The following benchmarks were performed on an AMD Ryzen 5 3600XT on Windows 11. `cri-archive-lib` is using `0.1.0` and was compiled with `-Ctarget-feature=+avx2`.
+See [`ENGINE_ANALYSIS.md`](ENGINE_ANALYSIS.md) for the engine functions and structural conclusions.
 
-#### CriLAYLA Decompression
+## Credits
 
-**[Sample 165 KB model file](https://github.com/Sewer56/CriFsV2Lib/blob/master/CriFsV2Lib.Tests/Assets/Compressed3dModel.crilayla)**
-
-| Library         | Mean               | Median             | Std Dev |
-|-----------------|--------------------|--------------------|---------|
-| CriPak          | 749.9 us (40.37%)  | 748.4 us (39.54%)  | 7.23 us |
-| CriFsLib        | 324.3 us (93.34%)  | 324.8 us (91.10%)  | 2.45 us |
-| cri-archive-lib | 302.7 us (100.00%) | 295.9 us (100.00%) | 18.7 us |
-
-#### Extracting File from CPK
-
-**6 MB model file + XOR decryption** (P5R `BASE.CPK\MODEL\CHARACTER\0001\C0001_002_00.GMD`)
-
-| Library         | Mean               | Median             | Std Dev  |
-|-----------------|--------------------|--------------------|----------|
-| CriFsLib        | 12.26 ms (83.20%)  | 12.26 ms (82.63%)  | 0.052 ms |
-| cri-archive-lib | 10.20 ms (100.00%) | 10.13 ms (100.00%) | 0.526 ms | 
-
-*Something to note for `CpkReader` is that it uses a free list to allow it to make zero allocations for small files (the setup is currently a 64 MB allocation split into 256 blocks, 256 KB each).*
-
-## Credits and Resources
-- **Sewer56** ([Github](https://github.com/Sewer56), [Bluesky](https://bsky.app/profile/sewer56.dev)) - Creator of CriFsV2Lib, the original C# implementation of the CPK extractor
-  - [`CriFsV2Lib`](https://github.com/Sewer56/CriFsV2Lib)
-
-The following credits are included from CriFsV2Lib:
-- **Lipsum** ([Github](https://github.com/zarroboogs)) - Original creator of P5R decryption function
-- **TGE** ([Github](https://github.com/tge-was-taken/), [Twitter](https://x.com/TGEnigma)) - [CRI Table 010 Template](https://github.com/tge-was-taken/010-Editor-Templates/blob/master/releases/cri_archives/cri_archives_rel_1.bt)
-- **Skyth** ([Github](https://github.com/blueskythlikesclouds), [Bluesky](https://bsky.app/profile/skyth.bsky.social)) - [MikuMikuLibrary `UtfTable`](https://github.com/blueskythlikesclouds/MikuMikuLibrary/blob/master/MikuMikuLibrary/Archives/CriMw/UtfTable.cs)
-- **CriPakTools Developers** - [CriPakTools](https://github.com/wmltogether/CriPakTools)
+The original reader/decompression work was based on CriFsV2Lib by Sewer56 and the CRI format research credited by the upstream project.

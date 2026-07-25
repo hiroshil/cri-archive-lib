@@ -1,7 +1,7 @@
 [workspace]
 
 members = [
-    "cri-archive-lib", "cri-cpk-extractor-cli"
+    "cri-archive-lib", "cri-cpk-cli"
 ]
 
 resolver = "2"

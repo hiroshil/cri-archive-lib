@@ -10,7 +10,7 @@ on:
 
 env:
   IS_RELEASE: ${{ startsWith(github.ref, 'refs/tags/') }}
-  OUTPUT_PATH: "./target/release/cri-cpk-extractor-cli"
+  OUTPUT_PATH: "./target/release/cri-cpk-cli"
   RELEASE_TAG: ${{ github.ref_name }}
   RELEASE_PATH: "./Release"
 
@@ -23,14 +23,14 @@ jobs:
             # Ubuntu
             runner-name: "ubuntu-latest",
             rust-target: "x86_64-unknown-linux-gnu",
-            release-name: "[CPK Extractor] Linux Release",
+            release-name: "[CPK CLI] Linux Release",
             rust-flags: "-Ctarget-feature=+avx2",
           },
           { 
             # Windows
             runner-name: "windows-latest",
             rust-target: "x86_64-pc-windows-msvc",
-            release-name: "[CPK Extractor] Windows Release",
+            release-name: "[CPK CLI] Windows Release",
             rust-flags: "-Ctarget-feature=+avx2",
           }
         ]
@@ -54,13 +54,13 @@ jobs:
       uses: actions-rs/cargo@v1
       with:
         command: build
-        args: --release
+        args: --workspace --all-features --release
 
     - name: Run All Tests
       uses: actions-rs/cargo@v1
       with:
         command: test
-        args: 
+        args: --workspace --all-features
 
     - name: Upload Output (Linux)
       uses: actions/upload-artifact@v4
@@ -89,14 +89,14 @@ jobs:
         uses: actions/download-artifact@v5
         if: env.IS_RELEASE == 'true'
         with:
-          name: ${{ '[CPK Extractor] Linux Release' }}
+          name: ${{ '[CPK CLI] Linux Release' }}
           path: ${{ env.RELEASE_PATH }}
 
       - name: Download Windows Release
         uses: actions/download-artifact@v5
         if: env.IS_RELEASE == 'true'
         with:
-          name: ${{ '[CPK Extractor] Windows Release' }}
+          name: ${{ '[CPK CLI] Windows Release' }}
           path: ${{ env.RELEASE_PATH }}
 
       - name: Upload to GitHub Releases (on Tag)

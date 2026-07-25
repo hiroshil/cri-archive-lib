@@ -2,23 +2,31 @@ use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::io::{Read, Seek, SeekFrom};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(feature = "cpk_compression_layla")]
 use crate::cpk::compress::layla::LaylaDecompressor;
 use crate::cpk::encrypt::data::{DummyDecryptor, FileDecryptor};
 use crate::cpk::file::CpkFile;
-use crate::cpk::free_list::{FreeList, FreeListNode};
-use crate::cpk::header::{HighTable, TableContainer};
-use crate::schema::columns::{Column, ColumnFlag};
-use crate::schema::rows::{Row, RowValue};
-use crate::schema::strings::{ StringPool, StringPoolFast };
+#[cfg(feature = "cpk_compression_layla")]
+use crate::cpk::free_list::FreeList;
+use crate::cpk::header::{row_value_to_u64, CpkChunkKind, HighTable, TableContainer};
+use crate::schema::rows::RowValue;
+use crate::schema::strings::{StringPool, StringPoolFast};
+
+const ENGINE_TOC_FILE_BASE: u64 = 0x800;
 
 #[derive(Debug)]
 pub enum CpkReaderError {
-    MissingTocOffset,
+    InvalidHeaderChunk,
     MissingContentOffset,
-    NoFileName,
-    NoFileSize,
-    NoExtractSize,
+    MissingFileName,
+    MissingFileSize,
+    MissingFileOffset,
+    MissingTocAndItoc,
+    InvalidTocColumn(&'static str),
+    InvalidItoc,
+    ItocContentOffsetTooLarge(u64),
+    FileTooLarge(u64),
     GetFilesNotCalled,
 }
 
@@ -26,23 +34,62 @@ impl Error for CpkReaderError {}
 
 impl Display for CpkReaderError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        <Self as Debug>::fmt(self, f)
+        match self {
+            Self::InvalidHeaderChunk => f.write_str("archive does not start with a CPK chunk"),
+            Self::MissingContentOffset => f.write_str("CPK header has no ContentOffset"),
+            Self::MissingFileName => f.write_str("TOC row has no FileName"),
+            Self::MissingFileSize => f.write_str("file row has no valid FileSize"),
+            Self::MissingFileOffset => f.write_str("TOC row has no valid FileOffset"),
+            Self::MissingTocAndItoc => f.write_str("CPK contains neither a TOC nor an ITOC"),
+            Self::InvalidTocColumn(name) => write!(f, "TOC is missing required column {name}"),
+            Self::InvalidItoc => f.write_str("invalid ITOC DataL/DataH structure"),
+            Self::ItocContentOffsetTooLarge(offset) => write!(
+                f,
+                "ITOC ContentOffset exceeds the target engine's 32-bit base: {offset:#x}"
+            ),
+            Self::FileTooLarge(size) => write!(f, "file size does not fit the CPK format: {size}"),
+            Self::GetFilesNotCalled => f.write_str("get_files must be called before extract_file"),
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CpkMetadata {
+    pub file_size: u64,
+    pub content_offset: u64,
+    pub content_size: u64,
+    pub toc_offset: u64,
+    pub toc_size: u64,
+    pub itoc_offset: u64,
+    pub itoc_size: u64,
+    pub etoc_offset: u64,
+    pub etoc_size: u64,
+    pub gtoc_offset: u64,
+    pub gtoc_size: u64,
+    pub version: u16,
+    pub revision: u16,
+    pub align: u16,
+    pub sorted: bool,
+    pub eid: u16,
+    pub files: u32,
+    pub cpk_mode: u32,
+    pub enable_file_name: bool,
+    pub update_date_time: u64,
+    pub codec: u32,
+    pub dpk_itoc: u32,
+    pub enable_toc_crc: bool,
+    pub enable_file_crc: bool,
 }
 
 #[derive(Debug)]
 pub struct CpkReader<R: Read + Seek, E: FileDecryptor = DummyDecryptor> {
     stream: R,
     start_pos: u64,
-    content_ofs: u64,
-    toc_table: Option<HighTable<StringPoolFast>>,
+    metadata: Option<CpkMetadata>,
+    #[cfg(feature = "cpk_compression_layla")]
     free_list: FreeList,
     decryption: PhantomData<E>,
-    lock: AtomicBool
 }
-
-unsafe impl<R: Read + Seek, E: FileDecryptor> Send for CpkReader<R, E> {}
-unsafe impl<R: Read + Seek, E: FileDecryptor> Sync for CpkReader<R, E> {}
 
 impl<R: Read + Seek> CpkReader<R> {
     pub fn new(stream: R) -> Result<Self, Box<dyn Error>> {
@@ -51,343 +98,308 @@ impl<R: Read + Seek> CpkReader<R> {
 }
 
 impl<R: Read + Seek, E: FileDecryptor> CpkReader<R, E> {
-    const DEFAULT_OFFSET: u64 = u64::MAX;
-
     pub fn new_with_encryption(mut stream: R) -> Result<Self, Box<dyn Error>> {
         let start_pos = stream.stream_position()?;
-        Ok(Self { stream, start_pos, content_ofs: Self::DEFAULT_OFFSET, toc_table: None,
-            free_list: FreeList::new(), decryption: PhantomData::<E>, lock: AtomicBool::new(false) })
+        Ok(Self {
+            stream,
+            start_pos,
+            metadata: None,
+            #[cfg(feature = "cpk_compression_layla")]
+            free_list: FreeList::new(),
+            decryption: PhantomData,
+        })
     }
 
-    #[inline]
-    fn acquire(&mut self) {
-        while self.lock.swap(true, Ordering::Acquire) {}
-    }
-
-    #[inline]
-    fn unacquire(&mut self) {
-        self.lock.store(false, Ordering::Release);
-    }
+    pub fn metadata(&self) -> Option<&CpkMetadata> { self.metadata.as_ref() }
 
     pub fn get_files(&mut self) -> Result<Vec<CpkFile>, Box<dyn Error>> {
         self.stream.seek(SeekFrom::Start(self.start_pos))?;
-        // Read CPK table to get offset to TOC and Content
-        let cpk_table = HighTable::<StringPoolFast>::new(
-            TableContainer::new(&mut self.stream)?)?;
-        let cpk_strs = cpk_table.get_strings();
-        let mut toc_offset= Self::DEFAULT_OFFSET;
-        for (col, row) in cpk_table.get_columns().iter()
-            .zip(cpk_table.get_rows()[0].iter()) {
-            if toc_offset != Self::DEFAULT_OFFSET && self.content_ofs != Self::DEFAULT_OFFSET { break; }
-            if col.get_value().get_flags().contains(ColumnFlag::NAME | ColumnFlag::ROW_STORAGE) {
-                if let RowValue::UInt64(v) = row {
-                    if let Some(str) = cpk_strs.get_string(col.get_string_offset()) {
-                        match str {
-                            "TocOffset" => toc_offset = *v,
-                            // cache content offset for extract_file calls
-                            "ContentOffset" => self.content_ofs = *v,
-                            _ => ()
-                        }
-                    }
-                }
-            }
+        let container = TableContainer::new(&mut self.stream)?;
+        if container.kind() != CpkChunkKind::Cpk {
+            return Err(Box::new(CpkReaderError::InvalidHeaderChunk));
         }
-        if toc_offset == Self::DEFAULT_OFFSET { return Err(Box::new(CpkReaderError::MissingTocOffset)) }
-        if self.content_ofs == Self::DEFAULT_OFFSET { return Err(Box::new(CpkReaderError::MissingContentOffset)) }
-        // In some CPKs offsets are relative to TOC as opposed to ContentOffset in header.
-        // This happens when TOC address is before ContentOffset.
-        if toc_offset < self.content_ofs {
-            self.content_ofs = toc_offset;
+        let cpk_table = HighTable::<StringPoolFast>::new(container.into_table())?;
+        if cpk_table.get_rows().is_empty() {
+            return Err(Box::new(CpkReaderError::InvalidHeaderChunk));
         }
-        // Read and cache TOC table
-        self.stream.seek(SeekFrom::Start(toc_offset))?;
-        self.toc_table = Some(HighTable::<StringPoolFast>::new(
-            TableContainer::new(&mut self.stream)?)?);
-        let toc_table = self.toc_table.as_mut().unwrap();
-        let toc_str = toc_table.get_strings();
-        let toc_indices = TocTableIndices::new(toc_str, toc_table.get_columns());
-        let toc_col = toc_table.get_columns();
-        let files = toc_table.get_rows();
-        let mut out = Vec::with_capacity(files.len());
-        for file in files {
-            let directory_name = file.cpk_get_directory_name(
-                &toc_col[toc_indices.dir_name], toc_str, toc_indices.dir_name)?;
-            let file_name = file.cpk_get_file_name(toc_str, toc_indices.file_name)?;
-            let file_offset = file.cpk_get_file_offset(toc_indices.file_offset)?;
-            let file_size = file.cpk_get_file_size(toc_indices.file_size)?;
-            let extract_size = file.cpk_get_extract_size(toc_indices.extract_size)?;
-            let user_string = file.cpk_get_user_string(
-                &toc_col[toc_indices.user_string], toc_str, toc_indices.user_string)?;
-            out.push(CpkFile::new(directory_name, file_name, file_offset, file_size, extract_size, user_string))
+
+        let metadata = parse_metadata(&cpk_table);
+        self.metadata = Some(metadata);
+
+        if metadata.toc_offset != 0 {
+            return self.read_toc(metadata);
         }
-        Ok(out)
+        if metadata.itoc_offset != 0 {
+            return self.read_itoc(metadata);
+        }
+        Err(Box::new(CpkReaderError::MissingTocAndItoc))
     }
 
-    #[inline]
-    pub fn extract_file(&self, file: &CpkFile) -> Result<FreeListNode, Box<dyn Error>> {
-        unsafe { &mut *(&raw const *self as *mut Self) }.extract_file_inner(file)
+    pub fn read_packed_file(&mut self, file: &CpkFile) -> Result<Vec<u8>, Box<dyn Error>> {
+        if self.metadata.is_none() {
+            return Err(Box::new(CpkReaderError::GetFilesNotCalled));
+        }
+        self.stream.seek(SeekFrom::Start(
+            self.start_pos
+                .checked_add(file.absolute_offset())
+                .ok_or(CpkReaderError::MissingFileOffset)?,
+        ))?;
+        let packed_size = usize::try_from(file.file_size())
+            .map_err(|_| CpkReaderError::FileTooLarge(u64::from(file.file_size())))?;
+        let mut output = vec![0u8; packed_size];
+        self.stream.read_exact(&mut output)?;
+        Ok(output)
     }
 
-    fn extract_file_inner(&mut self, file: &CpkFile) -> Result<FreeListNode, Box<dyn Error>> {
-        if self.content_ofs == Self::DEFAULT_OFFSET { return Err(Box::new(CpkReaderError::GetFilesNotCalled)) }
-        self.acquire();
-        self.stream.seek(SeekFrom::Start(self.content_ofs + file.file_offset()))?;
-        let mut out = self.free_list.allocate(file.file_size() as usize);
-        self.stream.read_exact(out.as_mut_slice())?;
-        self.unacquire();
-        if E::is_encrypted(file, out.as_slice()) {
-            E::decrypt_in_place(out.as_mut_slice());
+    pub fn extract_file_with_packed(
+        &mut self,
+        file: &CpkFile,
+    ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
+        let packed = self.read_packed_file(file)?;
+        let mut output = packed.clone();
+        if E::is_encrypted(file, &output) {
+            E::decrypt_in_place(&mut output);
         }
-        Ok(match LaylaDecompressor::is_compressed(out.as_slice()) {
-            true => LaylaDecompressor::decompress(out.as_slice(), &mut self.free_list),
-            false => out
-        })
+        #[cfg(feature = "cpk_compression_layla")]
+        if LaylaDecompressor::is_compressed(&output) {
+            output = LaylaDecompressor::decompress(&output, &mut self.free_list);
+        }
+        Ok((packed, output))
+    }
+
+    pub fn extract_file(&mut self, file: &CpkFile) -> Result<Vec<u8>, Box<dyn Error>> {
+        self.extract_file_with_packed(file).map(|(_, extracted)| extracted)
+    }
+
+    pub fn into_inner(self) -> R { self.stream }
+
+    fn read_toc(&mut self, metadata: CpkMetadata) -> Result<Vec<CpkFile>, Box<dyn Error>> {
+        let toc_position = self.start_pos.checked_add(metadata.toc_offset)
+            .ok_or(CpkReaderError::MissingFileOffset)?;
+        self.stream.seek(SeekFrom::Start(toc_position))?;
+        let container = TableContainer::new(&mut self.stream)?;
+        if container.kind() != CpkChunkKind::Toc {
+            return Err(Box::new(CpkReaderError::InvalidHeaderChunk));
+        }
+        let toc = HighTable::<StringPoolFast>::new(container.into_table())?;
+
+        let file_name_col = toc.column_index("FileName")
+            .ok_or(CpkReaderError::InvalidTocColumn("FileName"))?;
+        let file_size_col = toc.column_index("FileSize")
+            .ok_or(CpkReaderError::InvalidTocColumn("FileSize"))?;
+        let file_offset_col = toc.column_index("FileOffset")
+            .ok_or(CpkReaderError::InvalidTocColumn("FileOffset"))?;
+        let dir_name_col = toc.column_index("DirName");
+        let extract_size_col = toc.column_index("ExtractSize");
+        let id_col = toc.column_index("ID");
+        let user_string_col = toc.column_index("UserString");
+        let file_crc_col = toc.column_index("FileCrc");
+
+        // The analyzed engine resolves every TOC FileOffset from a fixed
+        // archive-relative base of 0x800, independently of ContentOffset.
+        let toc_base = ENGINE_TOC_FILE_BASE;
+
+        let mut files = Vec::with_capacity(toc.get_rows().len());
+        for row_index in 0..toc.get_rows().len() {
+            let file_name = string_at(&toc, row_index, file_name_col)
+                .ok_or(CpkReaderError::MissingFileName)?;
+            let directory = dir_name_col
+                .and_then(|index| string_at(&toc, row_index, index))
+                .unwrap_or("");
+            let user_string = user_string_col
+                .and_then(|index| string_at(&toc, row_index, index))
+                .unwrap_or("");
+            let file_size_u64 = numeric_at(&toc, row_index, file_size_col)
+                .ok_or(CpkReaderError::MissingFileSize)?;
+            let file_size = u32::try_from(file_size_u64)
+                .map_err(|_| CpkReaderError::FileTooLarge(file_size_u64))?;
+            let extract_size_u64 = extract_size_col
+                .and_then(|index| numeric_at(&toc, row_index, index))
+                .unwrap_or(file_size_u64);
+            let extract_size = u32::try_from(extract_size_u64)
+                .map_err(|_| CpkReaderError::FileTooLarge(extract_size_u64))?;
+            let file_offset = numeric_at(&toc, row_index, file_offset_col)
+                .ok_or(CpkReaderError::MissingFileOffset)?;
+            let id = id_col
+                .and_then(|index| numeric_at(&toc, row_index, index))
+                .and_then(|value| u32::try_from(value).ok());
+            let file_crc = file_crc_col
+                .and_then(|index| numeric_at(&toc, row_index, index))
+                .and_then(|value| u32::try_from(value).ok());
+            let absolute_offset = toc_base.checked_add(file_offset)
+                .ok_or(CpkReaderError::MissingFileOffset)?;
+
+            files.push(CpkFile::new(
+                directory,
+                file_name,
+                file_offset,
+                absolute_offset,
+                file_size,
+                extract_size,
+                id,
+                user_string,
+                file_crc,
+            ));
+        }
+        Ok(files)
+    }
+
+    fn read_itoc(&mut self, metadata: CpkMetadata) -> Result<Vec<CpkFile>, Box<dyn Error>> {
+        if metadata.content_offset == 0 {
+            return Err(Box::new(CpkReaderError::MissingContentOffset));
+        }
+        if metadata.content_offset > u64::from(u32::MAX) {
+            return Err(Box::new(CpkReaderError::ItocContentOffsetTooLarge(
+                metadata.content_offset,
+            )));
+        }
+        let itoc_position = self.start_pos.checked_add(metadata.itoc_offset)
+            .ok_or(CpkReaderError::MissingFileOffset)?;
+        self.stream.seek(SeekFrom::Start(itoc_position))?;
+        let container = TableContainer::new(&mut self.stream)?;
+        if container.kind() != CpkChunkKind::Itoc {
+            return Err(Box::new(CpkReaderError::InvalidHeaderChunk));
+        }
+        let itoc = HighTable::<StringPoolFast>::new(container.into_table())?;
+        let alignment = u64::from(metadata.align.max(1));
+        let mut relative_offset = 0u64;
+        let mut files = Vec::new();
+
+        if metadata.eid != 0 {
+            // Direct/EID ITOC stores the high-width rows in the outer table.
+            append_itoc_rows(
+                &itoc,
+                metadata.content_offset,
+                alignment,
+                &mut relative_offset,
+                &mut files,
+            )?;
+        } else {
+            // FUN_81066c36 always constructs both nested parsers when EID is
+            // zero. A missing DataL or DataH is invalid for this target even
+            // when the corresponding group has no rows.
+            let data_l = itoc.data_by_name(0, "DataL").ok_or(CpkReaderError::InvalidItoc)?;
+            let data_h = itoc.data_by_name(0, "DataH").ok_or(CpkReaderError::InvalidItoc)?;
+            let low = HighTable::<StringPoolFast>::new(data_l.to_vec())?;
+            let high = HighTable::<StringPoolFast>::new(data_h.to_vec())?;
+            append_itoc_rows(
+                &low,
+                metadata.content_offset,
+                alignment,
+                &mut relative_offset,
+                &mut files,
+            )?;
+            append_itoc_rows(
+                &high,
+                metadata.content_offset,
+                alignment,
+                &mut relative_offset,
+                &mut files,
+            )?;
+        }
+        Ok(files)
     }
 }
 
-impl Row {
-    pub(crate) fn cpk_get_file_name<'a, S: StringPool>(&'a self, string_pool: &'a S, col_index: usize)
-        -> Result<&'a str, Box<dyn Error>> {
-        match self[col_index] {
-            RowValue::String(ofs) => string_pool.get_string(ofs).map_or(
-                Err(Box::new(CpkReaderError::NoFileName)), |v| Ok(v)),
-            _ => Err(Box::new(CpkReaderError::NoFileName))
-        }
-    }
-
-    fn cpk_get_u32_value(&self, col_index: usize) -> Result<u32, Box<dyn Error>> {
-        match self[col_index] {
-            RowValue::UInt32(size) => Ok(size),
-            _ => Err(Box::new(CpkReaderError::NoFileName))
-        }
-    }
-
-    pub(crate) fn cpk_get_file_size(&self, col_index: usize)
-        -> Result<u32, Box<dyn Error>> {
-        self.cpk_get_u32_value(col_index)
-    }
-
-    pub(crate) fn cpk_get_extract_size(&self, col_index: usize)
-        -> Result<u32, Box<dyn Error>> {
-        self.cpk_get_u32_value(col_index)
-    }
-
-    pub(crate) fn cpk_get_file_offset(&self, col_index: usize) -> Result<u64, Box<dyn Error>> {
-        match self[col_index] {
-            RowValue::UInt64(size) => Ok(size),
-            _ => Err(Box::new(CpkReaderError::NoFileName))
-        }
-    }
-
-    pub(crate) fn cpk_get_string_may_default<'a, S: StringPool>(&'a self, column: &Column,
-        string_pool: &'a S, col_index: usize) -> Result<&'a str, Box<dyn Error>> {
-        if let RowValue::String(ofs) = self[col_index] {
-            if let Some(str) = string_pool.get_string(ofs) {
-                return Ok(str);
-            }
-        } else if let RowValue::None = self[col_index] {
-            if let Some(def) = column.get_default_value() {
-                if let RowValue::String(ofs) = *def {
-                    if let Some(str) = string_pool.get_string(ofs) {
-                        return Ok(str);
-                    }
-                }
-            }
-        }
-        Err(Box::new(CpkReaderError::NoFileName))
-    }
-
-    pub(crate) fn cpk_get_directory_name<'a, S: StringPool>(&'a self, column: &Column,
-        string_pool: &'a S, col_index: usize) -> Result<&'a str, Box<dyn Error>> {
-        self.cpk_get_string_may_default(column, string_pool, col_index)
-    }
-
-    pub(crate) fn cpk_get_user_string<'a, S: StringPool>(&'a self, column: &Column,
-        string_pool: &'a S, col_index: usize) -> Result<&'a str, Box<dyn Error>> {
-        self.cpk_get_string_may_default(column, string_pool, col_index)
+fn parse_metadata(table: &HighTable<StringPoolFast>) -> CpkMetadata {
+    let get = |name| table.u64_by_name(0, name).unwrap_or(0);
+    CpkMetadata {
+        file_size: get("FileSize"),
+        content_offset: get("ContentOffset"),
+        content_size: get("ContentSize"),
+        toc_offset: get("TocOffset"),
+        toc_size: get("TocSize"),
+        itoc_offset: get("ItocOffset"),
+        itoc_size: get("ItocSize"),
+        etoc_offset: get("EtocOffset"),
+        etoc_size: get("EtocSize"),
+        gtoc_offset: get("GtocOffset"),
+        gtoc_size: get("GtocSize"),
+        version: u16::try_from(get("Version")).unwrap_or(0),
+        revision: u16::try_from(get("Revision")).unwrap_or(0),
+        align: u16::try_from(get("Align")).unwrap_or(0),
+        sorted: get("Sorted") != 0,
+        eid: u16::try_from(get("EID")).unwrap_or(0),
+        files: u32::try_from(get("Files")).unwrap_or(0),
+        cpk_mode: u32::try_from(get("CpkMode")).unwrap_or(0),
+        enable_file_name: get("EnableFileName") != 0,
+        update_date_time: get("UpdateDateTime"),
+        codec: u32::try_from(get("Codec")).unwrap_or(0),
+        dpk_itoc: u32::try_from(get("DpkItoc")).unwrap_or(0),
+        enable_toc_crc: get("EnableTocCrc") != 0,
+        enable_file_crc: get("EnableFileCrc") != 0,
     }
 }
 
-#[derive(Debug)]
-struct TocTableIndices {
-    dir_name: usize,
-    file_name: usize,
-    file_size: usize,
-    extract_size: usize,
-    file_offset: usize,
-    user_string: usize
-}
-
-impl TocTableIndices {
-    pub(crate) fn new<S: StringPool>(pool: &S, cols: &[Column]) -> Self {
-        let mut inst = Self {
-            dir_name: usize::MAX,
-            file_name: usize::MAX,
-            file_size: usize::MAX,
-            extract_size: usize::MAX,
-            file_offset: usize::MAX,
-            user_string: usize::MAX
-        };
-        for (i, c) in cols.iter().enumerate() {
-            if let Some(s) = pool.get_string(c.get_string_offset()) {
-                match s {
-                    "DirName" => inst.dir_name = i,
-                    "FileName" => inst.file_name = i,
-                    "FileSize" => inst.file_size = i,
-                    "ExtractSize" => inst.extract_size = i,
-                    "FileOffset" => inst.file_offset = i,
-                    "UserString" => inst.user_string = i,
-                    _ => ()
-                }
-            }
-        }
-        inst
+fn string_at<'a>(table: &'a HighTable<StringPoolFast>, row: usize, column: usize) -> Option<&'a str> {
+    match table.value(row, column)? {
+        // CRI uses string offset zero as a null pointer. Pools commonly keep
+        // the literal marker "<NULL>" there, but the engine does not expose
+        // that marker as a directory or UserString value.
+        RowValue::String(0) => None,
+        RowValue::String(offset) => table.get_strings().get_string(*offset),
+        _ => None,
     }
 }
 
-#[cfg(test)]
-pub mod tests {
-    use std::collections::HashMap;
-    use std::error::Error;
-    use std::fs::File;
-    use std::io::BufReader;
-    use crate::cpk::encrypt::p5r::P5RDecryptor;
-    use crate::cpk::reader::CpkReader;
+fn numeric_at(table: &HighTable<StringPoolFast>, row: usize, column: usize) -> Option<u64> {
+    row_value_to_u64(table.value(row, column)?)
+}
 
-    #[test]
-    fn get_files_basic_table() -> Result<(), Box<dyn Error>> {
-        let sample_path = "E:/PersonaMultiplayer/CriFsV2Lib/CriFsV2Lib.Tests/Assets/SampleData.cpk";
-        if !std::fs::exists(sample_path)? {
-            return Ok(());
-        }
-        let mut reader = CpkReader::new(BufReader::new(File::open(sample_path)?))?;
-        let files = reader.get_files()?;
-        assert_eq!(files[0].directory(), "");
-        assert_eq!(files[0].file_name(), "Audio-NoCompression.flac");
-        assert_eq!(files[0].file_offset(), 0);
-        assert_eq!(files[0].file_size(), 48431);
-        assert_eq!(files[0].extract_size(), 48431);
-        assert_eq!(files[0].user_string(), "<NULL>");
-        assert_eq!(files[1].directory(), "");
-        assert_eq!(files[1].file_name(), "Image-NoCompression.jpg");
-        assert_eq!(files[1].file_offset(), 48640);
-        assert_eq!(files[1].file_size(), 120719);
-        assert_eq!(files[1].extract_size(), 120719);
-        assert_eq!(files[1].user_string(), "<NULL>");
-        assert_eq!(files[2].directory(), "");
-        assert_eq!(files[2].file_name(), "Text-Compressed.txt");
-        assert_eq!(files[2].file_offset(), 169472);
-        assert_eq!(files[2].file_size(), 2484);
-        assert_eq!(files[2].extract_size(), 3592);
-        assert_eq!(files[2].user_string(), "<NULL>");
-        Ok(())
+fn append_itoc_rows(
+    table: &HighTable<StringPoolFast>,
+    content_offset: u64,
+    alignment: u64,
+    relative_offset: &mut u64,
+    files: &mut Vec<CpkFile>,
+) -> Result<(), Box<dyn Error>> {
+    let id_col = table.column_index("ID").unwrap_or(0);
+    let file_size_col = table.column_index("FileSize").unwrap_or(1);
+    let extract_size_col = table.column_index("ExtractSize").unwrap_or(2);
+    let crc_col = table.column_index("FileCrc");
+
+    for row in 0..table.get_rows().len() {
+        let id_u64 = numeric_at(table, row, id_col).ok_or(CpkReaderError::InvalidItoc)?;
+        let id = u32::try_from(id_u64).map_err(|_| CpkReaderError::InvalidItoc)?;
+        let file_size_u64 = numeric_at(table, row, file_size_col)
+            .ok_or(CpkReaderError::MissingFileSize)?;
+        let file_size = u32::try_from(file_size_u64)
+            .map_err(|_| CpkReaderError::FileTooLarge(file_size_u64))?;
+        let extract_size_u64 = numeric_at(table, row, extract_size_col).unwrap_or(file_size_u64);
+        let extract_size = u32::try_from(extract_size_u64)
+            .map_err(|_| CpkReaderError::FileTooLarge(extract_size_u64))?;
+        let file_crc = crc_col
+            .and_then(|column| numeric_at(table, row, column))
+            .and_then(|value| u32::try_from(value).ok());
+        let absolute_offset = content_offset.checked_add(*relative_offset)
+            .ok_or(CpkReaderError::MissingFileOffset)?;
+        let file_name = format!("{id:05}.bin");
+        files.push(CpkFile::new(
+            "",
+            file_name,
+            *relative_offset,
+            absolute_offset,
+            file_size,
+            extract_size,
+            Some(id),
+            "",
+            file_crc,
+        ));
+        let padded_size = align_up(u64::from(file_size), alignment)
+            .ok_or(CpkReaderError::MissingFileOffset)?;
+        *relative_offset = (*relative_offset)
+            .checked_add(padded_size)
+            .ok_or(CpkReaderError::MissingFileOffset)?;
     }
+    Ok(())
+}
 
-    #[test]
-    fn get_files_encrypted_table() -> Result<(), Box<dyn Error>> {
-        let sample_path = "E:/PersonaMultiplayer/CriFsV2Lib/CriFsV2Lib.Tests/Assets/SampleData-Encrypted.cpk";
-        if !std::fs::exists(sample_path)? {
-            return Ok(());
-        }
-        let mut reader = CpkReader::new(BufReader::new(File::open(sample_path)?))?;
-        let files = reader.get_files()?;
-        assert_eq!(files[0].directory(), "");
-        assert_eq!(files[0].file_name(), "Audio-NoCompression.flac");
-        assert_eq!(files[0].file_offset(), 0);
-        assert_eq!(files[0].file_size(), 48431);
-        assert_eq!(files[0].extract_size(), 48431);
-        assert_eq!(files[0].user_string(), "<NULL>");
-        assert_eq!(files[1].directory(), "");
-        assert_eq!(files[1].file_name(), "Image-NoCompression.jpg");
-        assert_eq!(files[1].file_offset(), 48640);
-        assert_eq!(files[1].file_size(), 120719);
-        assert_eq!(files[1].extract_size(), 120719);
-        assert_eq!(files[1].user_string(), "<NULL>");
-        assert_eq!(files[2].directory(), "");
-        assert_eq!(files[2].file_name(), "Text-Compressed.txt");
-        assert_eq!(files[2].file_offset(), 169472);
-        assert_eq!(files[2].file_size(), 2484);
-        assert_eq!(files[2].extract_size(), 3592);
-        assert_eq!(files[2].user_string(), "<NULL>");
-        Ok(())
-    }
-
-    #[test]
-    fn extract_sample_image_uncompressed() -> Result<(), Box<dyn Error>> {
-        let sample_path = "E:/PersonaMultiplayer/CriFsV2Lib/CriFsV2Lib.Tests/Assets/SampleData-Encrypted.cpk";
-        let expected_path = "E:/PersonaMultiplayer/CriFsV2Lib/CriFsV2Lib.Tests/Assets/SampleData/Image-NoCompression.jpg";
-        if !std::fs::exists(sample_path)? || !std::fs::exists(expected_path)? {
-            return Ok(());
-        }
-        let mut reader = CpkReader::new(BufReader::new(File::open(sample_path)?))?;
-        let files = reader.get_files()?;
-        let img = reader.extract_file(&files[1])?; // Uncompressed Image
-        let expected = std::fs::read(expected_path)?;
-        assert_eq!(img, expected);
-        Ok(())
-    }
-
-    #[test]
-    fn extract_sample_text_compressed() -> Result<(), Box<dyn Error>> {
-        let sample_path = "E:/PersonaMultiplayer/CriFsV2Lib/CriFsV2Lib.Tests/Assets/SampleData-Encrypted.cpk";
-        let expected_path = "E:/PersonaMultiplayer/CriFsV2Lib/CriFsV2Lib.Tests/Assets/SampleData/Text-Compressed.txt";
-        if !std::fs::exists(sample_path)? || !std::fs::exists(expected_path)? {
-            return Ok(());
-        }
-        let mut reader = CpkReader::new(BufReader::new(File::open(sample_path)?))?;
-        let files = reader.get_files()?;
-        let text = reader.extract_file(&files[2])?; // Compressed Text
-        let expected = std::fs::read(expected_path)?;
-        assert_eq!(text, expected);
-        Ok(())
-    }
-
-    // Persona 5 Royal CPK read tests:
-    // Compression + Table Encryption + XOR Scrambling for each file
-
-    #[test]
-    fn get_files_p5r() -> Result<(), Box<dyn Error>> {
-        let sample_path = "E:/SteamLibrary/steamapps/common/P5R/CPK/BASE.CPK";
-        if !std::fs::exists(sample_path)? {
-            return Ok(());
-        }
-        let mut reader = CpkReader::new(BufReader::new(File::open(sample_path)?))?;
-        let _files = reader.get_files()?;
-        // for (i, file) in files.iter().enumerate() {
-        //     println!("{}: path: {}/{}, size: 0x{:x}/0x{:x}, ofs: 0x{:x}, user: {}", i, file.directory(), file.file_name(), file.file_size(), file.extract_size(), file.file_offset(), file.user_string());
-        // }
-        Ok(())
-    }
-
-    #[test]
-    fn extract_p5r_c0001_002_00() -> Result<(), Box<dyn Error>> {
-        let sample_path = "E:/SteamLibrary/steamapps/common/P5R/CPK/BASE.CPK";
-        let expected_path = "D:/PERSONA5ROYAL/BASE.CPK/MODEL/CHARACTER/0001/C0001_002_00.GMD";
-        if !std::fs::exists(sample_path)? || !std::fs::exists(expected_path)? {
-            return Ok(());
-        }
-        let mut reader = CpkReader::<_, P5RDecryptor>::new_with_encryption(
-            BufReader::new(File::open(sample_path)?))?;
-        let files = reader.get_files()?;
-        let mut file_lookup = HashMap::new();
-        for file in &files {
-            file_lookup.insert(format!("{}/{}", file.directory(), file.file_name()), file);
-        }
-        let joker_persona_5 = file_lookup.get("MODEL/CHARACTER/0001/C0001_002_00.GMD").unwrap();
-        let joker_persona_5 = reader.extract_file(joker_persona_5)?;
-        let expected = std::fs::read(expected_path)?;
-        assert_eq!(joker_persona_5, expected);
-        Ok(())
-    }
-
-    #[test]
-    fn get_files_p4g() -> Result<(), Box<dyn Error>> {
-        let sample_path = "E:/SteamLibrary/steamapps/common/Persona 4 Golden/data.cpk";
-        if !std::fs::exists(sample_path)? {
-            return Ok(());
-        }
-        let mut reader = CpkReader::new(BufReader::new(File::open(sample_path)?))?;
-        let _files = reader.get_files()?;
-        Ok(())
+fn align_up(value: u64, alignment: u64) -> Option<u64> {
+    if alignment <= 1 { return Some(value); }
+    let remainder = value % alignment;
+    if remainder == 0 {
+        Some(value)
+    } else {
+        value.checked_add(alignment - remainder)
     }
 }

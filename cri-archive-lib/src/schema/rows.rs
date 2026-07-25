@@ -1,6 +1,5 @@
 use std::error::Error;
 use std::io::{Read, Seek, SeekFrom};
-use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut, Index};
 use crate::schema::columns::{Column, ColumnFlag, ColumnType};
 use crate::schema::header::TableHeader;
@@ -67,9 +66,22 @@ impl DerefMut for Row {
 impl Row {
     pub fn new_list<C: Read + Seek>(handle: &mut C, header: &TableHeader, column_def: &[Column])
         -> Result<Vec<Self>, Box<dyn Error>> {
-        handle.seek(SeekFrom::Start(header.rows_offset() as u64))?;
+        let rows_offset = header.rows_offset() as u64;
+        let row_size = header.row_size() as u64;
         let mut rows = Vec::with_capacity(header.row_count() as usize);
-        for _ in 0..header.row_count() {
+        for row_index in 0..header.row_count() as u64 {
+            // CRI tables may include padding in each row. Seeking by RowSize
+            // keeps subsequent rows aligned even when the schema occupies fewer bytes.
+            let row_position = row_index
+                .checked_mul(row_size)
+                .and_then(|offset| rows_offset.checked_add(offset))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "CRI UTF row offset overflow",
+                    )
+                })?;
+            handle.seek(SeekFrom::Start(row_position))?;
             rows.push(Self::create_row(handle, column_def)?);
         }
         Ok(rows)
@@ -77,18 +89,23 @@ impl Row {
 
     fn create_row<C: Read + Seek>(handle: &mut C, column_def: &[Column]) -> Result<Self, Box<dyn Error>> {
         let mut column_data = vec![];
-        let mut field: MaybeUninit<[u8; 0x10]> = MaybeUninit::uninit();
+        let mut field = [0u8; 0x10];
         for c in column_def {
             let ctype = c.get_value().get_type();
+            if ctype == ColumnType::Invalid {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported CRI UTF column type",
+                )));
+            }
             // Handle null objects
             if !c.get_value().get_flags().contains(ColumnFlag::ROW_STORAGE) {
                 column_data.push(RowValue::None);
                 continue;
             }
-            let slice = unsafe { std::slice::from_raw_parts_mut(
-                field.as_mut_ptr() as *mut u8, ctype.get_size() as usize) };
+            let slice = &mut field[..ctype.get_size() as usize];
             handle.read_exact(slice)?;
-            column_data.push(Self::row_value(ctype, unsafe { field.assume_init_ref() }));
+            column_data.push(Self::row_value(ctype, &field));
         }
         Ok(Self(column_data))
     }
@@ -110,7 +127,13 @@ impl Row {
                 offset: from_slice!(&slice[0..4], u32),
                 length: from_slice!(&slice[4..8], u32),
             }),
-            ColumnType::Guid => todo!()
+            ColumnType::Guid => RowValue::Guid([
+                from_slice!(&slice[0..4], u32),
+                from_slice!(&slice[4..8], u32),
+                from_slice!(&slice[8..12], u32),
+                from_slice!(&slice[12..16], u32),
+            ]),
+            ColumnType::Invalid => RowValue::None,
         }
     }
 }
@@ -127,11 +150,10 @@ pub mod tests {
     use std::error::Error;
     use std::fs::File;
     use std::io::{BufReader, Read, Seek, SeekFrom};
-    use std::mem::MaybeUninit;
     use crate::schema::columns::Column;
     use crate::schema::header::{TableHeader, HEADER_SIZE};
     use crate::schema::rows::{DataValue, Row, RowValue};
-    use crate::schema::strings::{ StringPool, StringPoolImpl };
+    use crate::schema::strings::{StringPool, StringPoolImpl};
 
     struct OffsetedLowCpkReader(File);
 
@@ -165,13 +187,12 @@ pub mod tests {
             return Ok(());
         }
         let mut handle = BufReader::new(File::open(target_table)?);
-        let mut header_serial: MaybeUninit<[u8; HEADER_SIZE]> = MaybeUninit::uninit();
-        handle.read_exact(unsafe { header_serial.assume_init_mut() })?;
-        let header_serial = unsafe { header_serial.assume_init() };
+        let mut header_serial = [0u8; HEADER_SIZE];
+        handle.read_exact(&mut header_serial)?;
         let header = TableHeader::new(&header_serial);
         let columns = Column::new_list(&mut handle, &header)?;
 
-        let rows =  Row::new_list(&mut handle, &header, &columns)?;
+        let rows = Row::new_list(&mut handle, &header, &columns)?;
         let acb_row = &rows[0];
         assert_eq!(RowValue::UInt32(0), acb_row[0]); // FileIdentifier
         assert_eq!(RowValue::UInt32(20382208), acb_row[2]); // Version
@@ -188,12 +209,11 @@ pub mod tests {
         }
         let mut handle = OffsetedLowCpkReader::new(File::open(target_table)?);
         handle.seek(SeekFrom::Start(0))?; // go to first table (this will actually go to 0x10)
-        let mut first_header: MaybeUninit<[u8; HEADER_SIZE]> = MaybeUninit::uninit();
-        handle.read_exact(unsafe { first_header.assume_init_mut() })?;
-        let first_header = unsafe { first_header.assume_init() };
+        let mut first_header = [0u8; HEADER_SIZE];
+        handle.read_exact(&mut first_header)?;
         let header = TableHeader::new(&first_header);
         let columns = Column::new_list(&mut handle, &header)?;
-        let rows =  Row::new_list(&mut handle, &header, &columns)?;
+        let rows = Row::new_list(&mut handle, &header, &columns)?;
         let cpk_row = &rows[0];
         assert_eq!(RowValue::UInt64(1), cpk_row[0]); // UpdateDateTime
         assert_eq!(RowValue::None, cpk_row[1]); // FileSize
@@ -210,10 +230,9 @@ pub mod tests {
             return Ok(());
         }
         let mut handle = BufReader::new(File::open(path)?);
-        let mut header_serial: MaybeUninit<[u8; HEADER_SIZE]> = MaybeUninit::uninit();
+        let mut header_serial = [0u8; HEADER_SIZE];
         // Read the table header at 0x0 (ACB, ACF, AWB)
-        handle.read_exact(unsafe { header_serial.assume_init_mut() })?;
-        let header_serial = unsafe { header_serial.assume_init() };
+        handle.read_exact(&mut header_serial)?;
         let header = TableHeader::new(&header_serial);
         // Read columns/rows
         let columns = Column::new_list(&mut handle, &header)?;

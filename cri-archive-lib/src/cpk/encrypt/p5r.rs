@@ -33,7 +33,7 @@ impl FileDecryptor for P5RDecryptor {
     fn decrypt_in_place(input: &mut [u8]) {
         // Files shorter than 0x820 can't be "decrypted".
         // They aren't "encrypted" to begin with, even if they are marked with ENCRYPT user string
-        if input.len() <= 0x820 { return };
+        if input.len() < 0x820 { return; }
         let input = &mut input[P5RDecryptor::ENCRYPTED_DATA_OFFSET..];
         if cfg!(target_arch = "x86_64") {
             if cfg!(target_feature = "avx2") {
@@ -88,7 +88,7 @@ impl P5RDecryptor {
     }
 
     #[cfg(target_arch = "aarch64")]
-    const NEXT_BLOCK_NEON: usize = Self::NUM_BYTES_TO_DECRYPT / size_of::<__m128i>(); // 0x40
+    const NEXT_BLOCK_NEON: usize = Self::NUM_BYTES_TO_DECRYPT / size_of::<uint8x16_t>(); // 0x40
 
     #[inline(always)]
     #[allow(unused_variables, unused_mut)]

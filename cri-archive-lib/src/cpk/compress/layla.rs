@@ -43,7 +43,7 @@
 //! If the max value is returned, we read next number of bits in fib sequence, up to 8 bits. Then
 //! read 8s until max value no longer returned.
 
-use crate::cpk::free_list::{FreeList, FreeListNode};
+use crate::cpk::free_list::FreeList;
 use crate::from_slice;
 use crate::utils::slice::FromSlice;
 use crate::utils::endianness::LittleEndian;
@@ -313,17 +313,18 @@ impl LaylaDecompressor {
     const UNCOMPRESSED_DATA_SIZE: usize = 0x100;
 
     pub fn is_compressed(input: &[u8]) -> bool {
-        from_slice!(input, u64, LittleEndian) == LAYLA_HEADER_MAGIC
+        input.len() >= size_of::<LaylaHeader>()
+            && from_slice!(input, u64, LittleEndian) == LAYLA_HEADER_MAGIC
     }
 
-    pub fn decompress(input: &[u8], free_list: &mut FreeList) -> FreeListNode {
+    pub fn decompress(input: &[u8], free_list: &mut FreeList) -> Vec<u8> {
         let header = LaylaHeader::from_stream(input);
         let mut result = free_list.allocate(header.uncompressed_size as usize + Self::UNCOMPRESSED_DATA_SIZE);
         let cmp_slice = unsafe { std::slice::from_raw_parts(
             input.as_ptr().add(size_of::<LaylaHeader>()), input.len() - size_of::<LaylaHeader>()) };
         let mut dcmp_impl = LaylaDecompressorImpl::new(header, cmp_slice, result.as_mut_slice());
         dcmp_impl.decompress();
-        result
+        result.to_vec()
     }
 }
 

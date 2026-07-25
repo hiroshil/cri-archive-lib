@@ -21,6 +21,7 @@ pub mod cpk {
     pub mod free_list;
     pub mod reader;
     pub mod header;
+    pub mod writer;
 }
 pub mod schema {
     pub mod columns;

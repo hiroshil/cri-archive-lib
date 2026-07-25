@@ -1,7 +1,6 @@
 use std::error::Error;
 use std::fmt::{Debug, Formatter};
 use std::io::{Read, Seek, SeekFrom};
-use std::mem::MaybeUninit;
 use bitflags::bitflags;
 use crate::from_slice;
 use crate::schema::header::TableHeader;
@@ -33,7 +32,8 @@ pub enum ColumnType {
     Double = 9,
     String = 10,
     Data = 11,
-    Guid = 12
+    Guid = 12,
+    Invalid = 0xff,
 }
 
 impl ColumnType {
@@ -43,7 +43,8 @@ impl ColumnType {
             Self::UInt16 | Self::Int16 => 2,
             Self::UInt32 | Self::Int32 | Self::Single | Self::String => 4,
             Self::UInt64 | Self::Int64 | Self::Double | Self::Data => 8,
-            Self::Guid => 16
+            Self::Guid => 16,
+            Self::Invalid => 0,
         }
     }
 }
@@ -59,7 +60,22 @@ impl ColumnValue {
         ColumnFlag::from_bits_retain(self.0 & !TYPE_MASK)
     }
     pub const fn get_type(&self) -> ColumnType {
-        unsafe { std::mem::transmute(self.0 & TYPE_MASK) }
+        match self.0 & TYPE_MASK {
+            0 => ColumnType::Byte,
+            1 => ColumnType::SByte,
+            2 => ColumnType::UInt16,
+            3 => ColumnType::Int16,
+            4 => ColumnType::UInt32,
+            5 => ColumnType::Int32,
+            6 => ColumnType::UInt64,
+            7 => ColumnType::Int64,
+            8 => ColumnType::Single,
+            9 => ColumnType::Double,
+            10 => ColumnType::String,
+            11 => ColumnType::Data,
+            12 => ColumnType::Guid,
+            _ => ColumnType::Invalid,
+        }
     }
 }
 
@@ -95,21 +111,31 @@ impl Column {
     pub fn new_list<C: Read + Seek>(handle: &mut C, header: &TableHeader) -> Result<Vec<Self>, Box<dyn Error>> {
         handle.seek(SeekFrom::Start(crate::schema::header::HEADER_SIZE as u64))?;
         let mut columns: Vec<Self> = Vec::with_capacity(header.column_count() as usize);
-        let mut current: MaybeUninit<[u8; 5]> = MaybeUninit::uninit(); // maximum possible size for row
-        let mut default: MaybeUninit<[u8; 0x10]> = MaybeUninit::uninit();
+        let mut default_bytes = [0u8; 0x10];
         for _ in 0..header.column_count() as usize {
-            handle.read_exact(unsafe { current.assume_init_mut() })?;
-            let flag = ColumnValue(from_slice!(unsafe { current.assume_init_ref() }, u8));
-            let string_offset = from_slice!(unsafe { current.assume_init_ref() }, u32, 0x1);
-            let default = match flag.get_flags().contains(ColumnFlag::DEFAULT_VALUE) {
-                true => {
-                    let ctype = flag.get_type();
-                    let slice = unsafe { std::slice::from_raw_parts_mut(
-                        default.as_mut_ptr() as *mut u8, ctype.get_size() as usize) };
-                    handle.read_exact(slice)?;
-                    Some(Row::row_value(ctype, unsafe { default.assume_init_ref() }))
-                },
-                false => None
+            let mut flag_byte = [0u8; 1];
+            handle.read_exact(&mut flag_byte)?;
+            let flag = ColumnValue(flag_byte[0]);
+            let string_offset = if flag.get_flags().contains(ColumnFlag::NAME) {
+                let mut name_bytes = [0u8; 4];
+                handle.read_exact(&mut name_bytes)?;
+                from_slice!(&name_bytes, u32)
+            } else {
+                u32::MAX
+            };
+            let default = if flag.get_flags().contains(ColumnFlag::DEFAULT_VALUE) {
+                let ctype = flag.get_type();
+                let size = ctype.get_size() as usize;
+                if size == 0 {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unsupported CRI UTF column type",
+                    )));
+                }
+                handle.read_exact(&mut default_bytes[..size])?;
+                Some(Row::row_value(ctype, &default_bytes))
+            } else {
+                None
             };
             columns.push(Self::new(flag, string_offset, default));
         }
@@ -122,10 +148,9 @@ pub mod tests {
     use std::error::Error;
     use std::fs::File;
     use std::io::{BufReader, Read};
-    use std::mem::MaybeUninit;
     use crate::schema::columns::{Column, ColumnFlag, ColumnType};
     use crate::schema::header::{TableHeader, HEADER_SIZE};
-    use crate::schema::strings::{ StringPool, StringPoolImpl };
+    use crate::schema::strings::{StringPool, StringPoolImpl};
 
     #[test]
     fn read_columns_acb() -> Result<(), Box<dyn Error>> {
@@ -134,9 +159,8 @@ pub mod tests {
             return Ok(());
         }
         let mut handle = BufReader::new(File::open(target_table)?);
-        let mut header_serial: MaybeUninit<[u8; HEADER_SIZE]> = MaybeUninit::uninit();
-        handle.read_exact(unsafe { header_serial.assume_init_mut() })?;
-        let header_serial = unsafe { header_serial.assume_init() };
+        let mut header_serial = [0u8; HEADER_SIZE];
+        handle.read_exact(&mut header_serial)?;
         let header = TableHeader::new(&header_serial);
         let columns = Column::new_list(&mut handle, &header)?;
         let string_pool = StringPoolImpl::new(&mut handle, &header)?;

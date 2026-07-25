@@ -10,9 +10,7 @@ use crate::schema::strings::{StringPool, StringPoolFast};
 #[derive(Debug)]
 pub(crate) struct HighTable<S: StringPool> {
     alloc: NonNull<[u8]>,
-    #[allow(dead_code)]
     header: TableHeader,
-    columns: Vec<Column>,
     strings: S,
     rows: Vec<Row>,
     indices: HashMap<&'static str, usize>
@@ -26,7 +24,7 @@ impl HighTable<StringPoolFast> {
         let columns = Column::new_list(&mut cursor, &header)?;
         let str_raw = &alloc[header.string_pool_offset() as usize..header.data_pool_offset() as usize];
         let rows = Row::new_list(&mut cursor, &header, columns.as_ref())?;
-        let strings = unsafe { StringPoolFast::new_borrowed(&str_raw, &header)? };
+        let strings = StringPoolFast::new_borrowed(str_raw, &header)?;
         let alloc = unsafe { NonNull::new_unchecked(&raw const *alloc as _) };
 
 
@@ -38,13 +36,12 @@ impl HighTable<StringPoolFast> {
                         std::slice::from_raw_parts(str.as_ptr(), str.len())) }, i))
                 )
         );
-        Ok(Self { alloc, header, columns, strings, rows, indices })
+        Ok(Self { alloc, header, strings, rows, indices })
     }
 }
 
 impl<S: StringPool> HighTable<S> {
     pub fn get_header(&self) -> &TableHeader { &self.header }
-    pub fn get_columns(&self) -> &[Column] { self.columns.as_ref() }
     pub fn get_strings(&self) -> &S { &self.strings }
     pub fn get_rows(&self) -> &[Row] { &self.rows }
     pub fn get_slice(&self) -> &[u8] { unsafe { self.alloc.as_ref() } }

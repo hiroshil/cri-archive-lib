@@ -14,7 +14,6 @@
 //! - u32 RowCount: 0x1c,
 
 use std::fmt::{Debug, Formatter};
-use std::ptr::NonNull;
 use crate::from_slice;
 use crate::utils::endianness::BigEndian;
 use crate::utils::slice::FromSlice;
@@ -36,52 +35,55 @@ impl From<u8> for StringEncoding {
 }
 
 
-pub(crate) static HEADER_OFFSET: u32 = 0x8;
-pub static HEADER_SIZE: usize = 0x20;
+pub(crate) const HEADER_OFFSET: u32 = 0x8;
+pub const HEADER_SIZE: usize = 0x20;
 
-//pub(crate) struct TableHeader<'a> {
+#[derive(Clone)]
 pub struct TableHeader {
-    /// Byte slice associated with this header instance. It's assumed that the slice is large
-    /// enough to contain the entire table
-    pub(crate) owner: NonNull<[u8]>,
+    /// Owned copy of the fixed-size UTF header. Keeping this data owned avoids
+    /// dangling pointers when the source table buffer is moved or dropped.
+    pub(crate) bytes: [u8; HEADER_SIZE],
 }
 
 impl TableHeader {
     pub fn new(file: &[u8]) -> Self {
-        Self { owner: unsafe { NonNull::new_unchecked(&raw const* file as _) } }
+        let mut bytes = [0u8; HEADER_SIZE];
+        let copy_len = file.len().min(HEADER_SIZE);
+        bytes[..copy_len].copy_from_slice(&file[..copy_len]);
+        Self { bytes }
     }
 
     pub fn size(&self) -> u32 {
-        from_slice!(unsafe { self.owner.as_ref() }, u32, 0x4)
+        from_slice!(&self.bytes, u32, 0x4)
     }
 
     pub fn encoding(&self) -> StringEncoding {
-        from_slice!(unsafe { self.owner.as_ref() }, u8, 0x9).into()
+        from_slice!(&self.bytes, u8, 0x9).into()
     }
 
-    pub fn rows_offset(&self) -> u16 {
-        from_slice!(unsafe { self.owner.as_ref() }, u16, 0xa) + HEADER_OFFSET as u16
+    pub fn rows_offset(&self) -> u32 {
+        u32::from(from_slice!(&self.bytes, u16, 0xa)) + HEADER_OFFSET
     }
 
     pub fn string_pool_offset(&self) -> u32 {
-        from_slice!(unsafe { self.owner.as_ref() }, u32, 0xc) + HEADER_OFFSET
+        from_slice!(&self.bytes, u32, 0xc).saturating_add(HEADER_OFFSET)
     }
 
     pub fn data_pool_offset(&self) -> u32 {
-        from_slice!(unsafe { self.owner.as_ref() }, u32, 0x10) + HEADER_OFFSET
+        from_slice!(&self.bytes, u32, 0x10).saturating_add(HEADER_OFFSET)
     }
 
     // Field data
     pub fn column_count(&self) -> u16 {
-        from_slice!(unsafe { self.owner.as_ref() }, u16, 0x18)
+        from_slice!(&self.bytes, u16, 0x18)
     }
 
     pub fn row_size(&self) -> u16 {
-        from_slice!(unsafe { self.owner.as_ref() }, u16, 0x1a)
+        from_slice!(&self.bytes, u16, 0x1a)
     }
 
     pub fn row_count(&self) -> u32 {
-        from_slice!(unsafe { self.owner.as_ref() }, u32, 0x1c)
+        from_slice!(&self.bytes, u32, 0x1c)
     }
 }
 
@@ -98,7 +100,6 @@ pub mod tests {
     use std::error::Error;
     use std::fs::File;
     use std::io::SeekFrom;
-    use std::mem::MaybeUninit;
     use std::io::{Read, Seek};
 
     #[test]
@@ -144,9 +145,8 @@ pub mod tests {
         let mut handle = File::open(target_table)?;
         handle.seek(SeekFrom::Start(0x10))?; // go to first table
         // this CPK table is not encrypted so we can immediately use TableHeader
-        let mut first_header: MaybeUninit<[u8; HEADER_SIZE]> = MaybeUninit::uninit();
-        handle.read_exact(unsafe { first_header.assume_init_mut() })?;
-        let first_header = unsafe { first_header.assume_init() };
+        let mut first_header = [0u8; HEADER_SIZE];
+        handle.read_exact(&mut first_header)?;
         let header = TableHeader::new(&first_header);
         assert_eq!(252, header.rows_offset());
         assert_eq!(378, header.string_pool_offset());

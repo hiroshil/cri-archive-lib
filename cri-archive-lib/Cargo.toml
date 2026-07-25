@@ -15,9 +15,11 @@ encoding_rs = "0.8.35"
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 
+
 [[bench]]
 name = "benchmarks"
 harness = false
+required-features = ["cpk_full"]
 
 [features]
 acb = []
@@ -30,7 +32,7 @@ cpk = []
 cpk_compression_layla = ["cpk"]
 # Handle Persona 5 Royal's file encryption
 cpk_encryption_p5r = ["cpk"]
-# Handle CRI table encryption
+# Expose the CRI table-cipher helper (CPK parsing itself always handles encrypted tables)
 cpk_encryption_table = ["cpk"]
 
 # Enable all optional CPK features

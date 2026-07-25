@@ -1,5 +1,5 @@
 [package]
-name = "cri-cpk-extractor-cli"
+name = "cri-cpk-cli"
 version.workspace = true
 authors.workspace = true
 categories.workspace = true
@@ -9,8 +9,5 @@ license-file.workspace = true
 edition.workspace = true
 
 [dependencies]
-console = "0.16.2"
-crossterm = "0.29.0"
 cri-archive-lib = { path = "../cri-archive-lib" ,features = ["cpk_full"] }
 indicatif = "0.18.3"
-rayon = "1.11.0"
