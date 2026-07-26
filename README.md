@@ -45,7 +45,7 @@ Without a manifest, `pack` creates a new TOC archive and assigns deterministic I
 - TOC at `0x0800` when present;
 - TOC `FileOffset` stored relative to `0x0800`;
 - ITOC payload offsets computed from `ContentOffset` by aligned cumulative packed sizes; ITOC output is rejected when `ContentOffset > 0xffffffff` because this engine stores the base in a 32-bit state field;
-- standard ITOC physical order: `DataL` rows, then `DataH` rows;
+- standard ITOC physical order: stable merge of `DataL` and `DataH` rows by ascending ID; the nested tables are separate indexes, not separate payload regions;
 - each ITOC table sorted by ascending 16-bit ID because the engine binary-searches it;
 - both `DataL` and `DataH` are emitted in standard ITOC, using a valid zero-row nested table when a group is empty;
 - content, every payload start, and final archive size aligned to `Align`;

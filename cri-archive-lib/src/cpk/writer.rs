@@ -527,25 +527,13 @@ fn build_physical_order(
         }
     }
 
-    if profile.direct_itoc {
-        let mut order = (0..files.len()).collect::<Vec<_>>();
-        order.sort_by_key(|index| files[*index].id);
-        return Ok(order);
-    }
-
-    let mut low = Vec::new();
-    let mut high = Vec::new();
-    for (index, file) in files.iter().enumerate() {
-        if file.size <= u16::MAX as u32 && file.extract_size <= u16::MAX as u32 {
-            low.push(index);
-        } else {
-            high.push(index);
-        }
-    }
-    low.sort_by_key(|index| files[*index].id);
-    high.sort_by_key(|index| files[*index].id);
-    low.extend(high);
-    Ok(low)
+    // Direct and standard ITOC use the same physical payload order: IDs
+    // ascending across the union of DataL and DataH. FUN_8106706C obtains the
+    // insertion index in the opposite table and FUN_81066ED2 sums both ID
+    // prefixes, which is exactly a stable merge rather than low-then-high.
+    let mut order = (0..files.len()).collect::<Vec<_>>();
+    order.sort_by_key(|index| files[*index].id);
+    Ok(order)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -656,15 +644,20 @@ fn build_itoc_table(
         return build_itoc_rows(files, physical_order, false, "CpkExtendId");
     }
 
-    let split = physical_order
-        .iter()
-        .position(|index| {
-            files[*index].size > u16::MAX as u32
-                || files[*index].extract_size > u16::MAX as u32
-        })
-        .unwrap_or(physical_order.len());
-    let low = &physical_order[..split];
-    let high = &physical_order[split..];
+    // The nested tables remain independent ID-sorted indexes, but their rows
+    // do not define two contiguous payload regions. The engine merges their
+    // prefixes by ID when calculating each physical offset.
+    let mut low = Vec::new();
+    let mut high = Vec::new();
+    for &index in physical_order {
+        if files[index].size <= u16::MAX as u32
+            && files[index].extract_size <= u16::MAX as u32
+        {
+            low.push(index);
+        } else {
+            high.push(index);
+        }
+    }
 
     // The target engine unconditionally constructs both nested parsers when
     // EID is zero. Omitting DataL or DataH makes it call the UTF parser with a
@@ -675,8 +668,8 @@ fn build_itoc_table(
         UtfColumn::new("DataH", UtfType::Data),
     ];
     let row = vec![
-        UtfValue::Data(build_itoc_rows(files, low, true, "CpkItocL")?),
-        UtfValue::Data(build_itoc_rows(files, high, false, "CpkItocH")?),
+        UtfValue::Data(build_itoc_rows(files, &low, true, "CpkItocL")?),
+        UtfValue::Data(build_itoc_rows(files, &high, false, "CpkItocH")?),
     ];
     UtfTableBuilder::new("CpkItocInfo", columns, vec![row]).build()
 }

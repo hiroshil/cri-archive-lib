@@ -202,7 +202,7 @@ fn standard_itoc_high_only_keeps_both_nested_tables() -> Result<(), Box<dyn Erro
 }
 
 #[test]
-fn standard_itoc_places_low_group_before_high_group() -> Result<(), Box<dyn Error>> {
+fn standard_itoc_merges_low_and_high_rows_by_id() -> Result<(), Box<dyn Error>> {
     let root = unique_temp_path("itoc-mixed");
     let input = root.join("input");
     let archive = root.join("mixed.cpk");
@@ -227,10 +227,10 @@ fn standard_itoc_places_low_group_before_high_group() -> Result<(), Box<dyn Erro
         .iter()
         .map(|file| file.id().expect("ITOC row must have an ID"))
         .collect::<Vec<_>>();
-    // The engine searches each group independently and computes physical
-    // offsets as all low rows followed by all high rows. This is not a single
-    // global ID sort when a high-width ID is numerically smaller.
-    assert_eq!(ids, vec![2, 7, 1]);
+    // FUN_8106706C combines each table's binary-search position and
+    // FUN_81066ED2 sums both prefixes, so physical payloads are globally
+    // ID-sorted even when low/high-width rows interleave.
+    assert_eq!(ids, vec![1, 2, 7]);
     for file in &rows {
         let expected = match file.id().unwrap() {
             1 => large.as_slice(),

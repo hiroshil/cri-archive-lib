@@ -12,8 +12,8 @@ Completed in this environment:
 - verified CPK header containment before `0x800`, canonical plaintext chunk marker `ff ff ff ff`, and `(c)CRI` at `0x7fa`;
 - verified TOC at `0x800` and payload lookup as `0x800 + FileOffset`;
 - verified ITOC payload lookup from `ContentOffset` using aligned cumulative packed sizes and added a reader/writer guard for the engine's 32-bit ITOC content base;
-- verified standard ITOC physical order is low rows followed by high rows;
-- verified each low/high/direct ITOC table is sorted by ascending 16-bit ID;
+- verified standard ITOC physical order is the ascending-ID merge of low/high rows, matching the two-table prefix sum in `FUN_8106706C`/`FUN_81066ED2`;
+- verified each low/high/direct ITOC table is sorted by ascending 16-bit ID and added a mixed-width regression where a high row is numerically between low rows;
 - verified standard ITOC always contains both `DataL` and `DataH`, including valid zero-row nested tables for empty groups;
 - verified the engine-specific `@UTF` marker, encoding byte, big-endian `u16 RowsOffset`, section offsets, row widths, string references, and nested data-table offsets;
 - verified TOC+ITOC uses one shared physical payload plan and consistent TOC offsets;

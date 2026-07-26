@@ -262,18 +262,11 @@ impl<R: Read + Seek, E: FileDecryptor> CpkReader<R, E> {
         }
         let itoc = HighTable::<StringPoolFast>::new(container.into_table())?;
         let alignment = u64::from(metadata.align.max(1));
-        let mut relative_offset = 0u64;
-        let mut files = Vec::new();
+        let mut rows = Vec::new();
 
         if metadata.eid != 0 {
             // Direct/EID ITOC stores the high-width rows in the outer table.
-            append_itoc_rows(
-                &itoc,
-                metadata.content_offset,
-                alignment,
-                &mut relative_offset,
-                &mut files,
-            )?;
+            collect_itoc_rows(&itoc, &mut rows)?;
         } else {
             // FUN_81066c36 always constructs both nested parsers when EID is
             // zero. A missing DataL or DataH is invalid for this target even
@@ -282,22 +275,21 @@ impl<R: Read + Seek, E: FileDecryptor> CpkReader<R, E> {
             let data_h = itoc.data_by_name(0, "DataH").ok_or(CpkReaderError::InvalidItoc)?;
             let low = HighTable::<StringPoolFast>::new(data_l.to_vec())?;
             let high = HighTable::<StringPoolFast>::new(data_h.to_vec())?;
-            append_itoc_rows(
-                &low,
-                metadata.content_offset,
-                alignment,
-                &mut relative_offset,
-                &mut files,
-            )?;
-            append_itoc_rows(
-                &high,
-                metadata.content_offset,
-                alignment,
-                &mut relative_offset,
-                &mut files,
-            )?;
+            collect_itoc_rows(&low, &mut rows)?;
+            collect_itoc_rows(&high, &mut rows)?;
         }
-        Ok(files)
+
+        // FUN_8106706C searches DataL and DataH independently, converts the
+        // opposite table's failed search into an insertion index, then asks
+        // FUN_81066ED2 to sum both prefixes. Consequently payloads are laid
+        // out as the stable merge of both tables by ID, not DataL followed by
+        // DataH. This distinction is essential whenever low/high-width rows
+        // interleave, as they do in this engine's SC/BK/BSF/PT archives.
+        rows.sort_by_key(|row| row.id);
+        if rows.windows(2).any(|pair| pair[0].id == pair[1].id) {
+            return Err(Box::new(CpkReaderError::InvalidItoc));
+        }
+        materialize_itoc_rows(&rows, metadata.content_offset, alignment)
     }
 }
 
@@ -346,18 +338,24 @@ fn numeric_at(table: &HighTable<StringPoolFast>, row: usize, column: usize) -> O
     row_value_to_u64(table.value(row, column)?)
 }
 
-fn append_itoc_rows(
+#[derive(Debug, Clone, Copy)]
+struct ItocRow {
+    id: u32,
+    file_size: u32,
+    extract_size: u32,
+    file_crc: Option<u32>,
+}
+
+fn collect_itoc_rows(
     table: &HighTable<StringPoolFast>,
-    content_offset: u64,
-    alignment: u64,
-    relative_offset: &mut u64,
-    files: &mut Vec<CpkFile>,
+    rows: &mut Vec<ItocRow>,
 ) -> Result<(), Box<dyn Error>> {
     let id_col = table.column_index("ID").unwrap_or(0);
     let file_size_col = table.column_index("FileSize").unwrap_or(1);
     let extract_size_col = table.column_index("ExtractSize").unwrap_or(2);
     let crc_col = table.column_index("FileCrc");
 
+    rows.reserve(table.get_rows().len());
     for row in 0..table.get_rows().len() {
         let id_u64 = numeric_at(table, row, id_col).ok_or(CpkReaderError::InvalidItoc)?;
         let id = u32::try_from(id_u64).map_err(|_| CpkReaderError::InvalidItoc)?;
@@ -371,27 +369,46 @@ fn append_itoc_rows(
         let file_crc = crc_col
             .and_then(|column| numeric_at(table, row, column))
             .and_then(|value| u32::try_from(value).ok());
-        let absolute_offset = content_offset.checked_add(*relative_offset)
+        rows.push(ItocRow {
+            id,
+            file_size,
+            extract_size,
+            file_crc,
+        });
+    }
+    Ok(())
+}
+
+fn materialize_itoc_rows(
+    rows: &[ItocRow],
+    content_offset: u64,
+    alignment: u64,
+) -> Result<Vec<CpkFile>, Box<dyn Error>> {
+    let mut relative_offset = 0u64;
+    let mut files = Vec::with_capacity(rows.len());
+    for row in rows {
+        let absolute_offset = content_offset
+            .checked_add(relative_offset)
             .ok_or(CpkReaderError::MissingFileOffset)?;
-        let file_name = format!("{id:05}.bin");
+        let file_name = format!("{:05}.bin", row.id);
         files.push(CpkFile::new(
             "",
             file_name,
-            *relative_offset,
+            relative_offset,
             absolute_offset,
-            file_size,
-            extract_size,
-            Some(id),
+            row.file_size,
+            row.extract_size,
+            Some(row.id),
             "",
-            file_crc,
+            row.file_crc,
         ));
-        let padded_size = align_up(u64::from(file_size), alignment)
+        let padded_size = align_up(u64::from(row.file_size), alignment)
             .ok_or(CpkReaderError::MissingFileOffset)?;
-        *relative_offset = (*relative_offset)
+        relative_offset = relative_offset
             .checked_add(padded_size)
             .ok_or(CpkReaderError::MissingFileOffset)?;
     }
-    Ok(())
+    Ok(files)
 }
 
 fn align_up(value: u64, alignment: u64) -> Option<u64> {

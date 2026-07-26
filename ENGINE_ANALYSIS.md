@@ -78,14 +78,20 @@ For `EID == 0`, `FUN_81066c36` looks up `DataL` and `DataH`, then unconditionall
 
 `FUN_81066c36` copies only the low 32 bits of `ContentOffset` into the ITOC state. The reader and writer therefore reject ITOC archives whose content base exceeds `0xffffffff` instead of allowing engine-side wraparound.
 
-`FUN_81066ed2` starts at that `ContentOffset` and computes offsets by summing aligned packed sizes. Standard ITOC always places all low rows before all high rows:
+`FUN_8106706c` binary-searches both nested tables for the requested ID. When the ID exists in one table, the negative result from the other table is converted into that table's insertion index. It then calls `FUN_81066ed2` with both prefix lengths. `FUN_81066ed2` sums the aligned sizes of the first `low_prefix` DataL rows and the first `high_prefix` DataH rows.
+
+This proves that the physical stream is the stable merge of both tables by ascending ID:
 
 ```text
-absolute_offset = ContentOffset
-                + sum(align_up(previous FileSize, Align))
+absolute_offset(id) = ContentOffset
+                    + sum(align_up(FileSize(row), Align)
+                          for row in merge_by_id(DataL, DataH)
+                          before id)
 ```
 
-Direct ITOC uses its single ID-sorted row order. The writer builds one physical payload plan first and uses that same plan for ITOC rows and, when present, TOC `FileOffset` values.
+It is **not** `DataL` followed by `DataH`. The distinction is observable in the target archives: SC, BK, BSF, and PT all contain interleaved low/high IDs. Applying low-then-high offsets shifts every payload after the first high-width ID and makes valid scenario/image records appear malformed.
+
+Direct ITOC uses the same ascending-ID physical order through its single table. The writer builds one merged physical payload plan first and uses that same plan for ITOC rows and, when present, TOC `FileOffset` values.
 
 ## `@UTF` layout
 

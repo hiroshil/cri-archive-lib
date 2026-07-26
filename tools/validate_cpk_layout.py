@@ -162,19 +162,13 @@ def parse_utf(data):
 
 
 def itoc_order(entries, direct):
+    del direct
     assert len({entry.entry_id for entry in entries}) == len(entries)
     assert all(0 <= entry.entry_id <= 0xFFFF for entry in entries)
-    if direct:
-        return sorted(range(len(entries)), key=lambda index: entries[index].entry_id)
-    low = [
-        index
-        for index, entry in enumerate(entries)
-        if entry.packed_size <= 0xFFFF and entry.unpacked_size <= 0xFFFF
-    ]
-    high = [index for index in range(len(entries)) if index not in low]
-    low.sort(key=lambda index: entries[index].entry_id)
-    high.sort(key=lambda index: entries[index].entry_id)
-    return low + high
+    # FUN_8106706C combines the insertion positions from DataL and DataH and
+    # FUN_81066ED2 sums both prefixes. The physical stream is therefore the
+    # stable merge by ID for direct and standard ITOC alike.
+    return sorted(range(len(entries)), key=lambda index: entries[index].entry_id)
 
 
 def build_itoc_rows(entries, indices, low, name):
@@ -190,16 +184,12 @@ def build_itoc_rows(entries, indices, low, name):
 def build_itoc(entries, order, direct):
     if direct:
         return build_itoc_rows(entries, order, False, "CpkExtendId")
-    split = next(
-        (
-            i
-            for i, index in enumerate(order)
-            if entries[index].packed_size > 0xFFFF or entries[index].unpacked_size > 0xFFFF
-        ),
-        len(order),
-    )
-    low = order[:split]
-    high = order[split:]
+    low = [
+        index
+        for index in order
+        if entries[index].packed_size <= 0xFFFF and entries[index].unpacked_size <= 0xFFFF
+    ]
+    high = [index for index in order if index not in low]
     # EID=0 makes the analyzed engine instantiate both nested tables without
     # checking whether either column is absent. Empty groups therefore remain
     # valid zero-row @UTF tables instead of omitted columns.
@@ -419,16 +409,19 @@ def validate_archive(archive, entries, expected_toc, expected_itoc, expected_dir
             assert set(outer) == {"DataL", "DataH"}
             groups.append((parse_utf(outer["DataL"]), True))
             groups.append((parse_utf(outer["DataH"]), False))
-        flattened = []
+        indexed = []
         for rows, low in groups:
             ids = [row["ID"] for row in rows]
             assert ids == sorted(ids), "engine uses binary search in each ITOC table"
             for row in rows:
                 if low:
                     assert row["FileSize"] <= 0xFFFF and row["ExtractSize"] <= 0xFFFF
-                flattened.append(row)
+                indexed.append(row)
+        # The nested row storage stays separate, but payload offsets use the
+        # merged ID order reconstructed by the engine's two binary searches.
+        merged = sorted(indexed, key=lambda row: row["ID"])
         cursor = header["ContentOffset"]
-        for row in flattened:
+        for row in merged:
             entry = by_id[row["ID"]]
             assert archive[cursor : cursor + row["FileSize"]] == entry.payload
             assert row["ExtractSize"] == entry.unpacked_size
